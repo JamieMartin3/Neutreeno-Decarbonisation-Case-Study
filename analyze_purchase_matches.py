@@ -57,6 +57,7 @@ def plot_certainty_metrics(records: List[Dict[str, Any]], max_score: float, plot
     certainties: List[float] = []
     ef_certainty: List[Tuple[str, float]] = []
     ef_spend_certainty: List[Tuple[str, float]] = []
+    hotspot_scores: List[Tuple[str, float]] = []
 
     for idx, record in enumerate(records):
         matches = record.get("matches") or record.get("selected_matches") or []
@@ -83,6 +84,7 @@ def plot_certainty_metrics(records: List[Dict[str, Any]], max_score: float, plot
         ghg_value = emission_ratio
         if is_valid_number(ghg_value):
             ef_certainty.append((str(label), ghg_value * float(certainty)))
+            hotspot_scores.append((str(label), ghg_value * (1.0 - float(certainty))))
 
             spend = to_float(best_match.get("total_spend_gbp"))
             if is_valid_number(spend):
@@ -140,7 +142,18 @@ def plot_certainty_metrics(records: List[Dict[str, Any]], max_score: float, plot
                 plots_dir / "emission_spend_certainty_top10.png",
                 rotation=45,
             )
-        return
+
+    if hotspot_scores:
+        top10_hotspots = sorted(hotspot_scores, key=lambda x: x[1], reverse=True)[:10]
+        labels_hot, values_hot = zip(*top10_hotspots)
+        plot_bar(
+            list(labels_hot),
+            list(values_hot),
+            "Top 10 Uncertainty Hotspots",
+            "kg CO2e × (1 - certainty)",
+            plots_dir / "emission_uncertainty_hotspots_top10.png",
+            rotation=45,
+        )
 
 
 def inject_top_certainty(records: List[Dict[str, Any]]) -> None:
