@@ -156,18 +156,6 @@ def main() -> None:
         help="Batch size when encoding texts.",
     )
     parser.add_argument(
-        "--score-mode",
-        choices=["cosine", "softmax"],
-        default="cosine",
-        help="Similarity scoring strategy. 'cosine' uses raw cosine similarity; 'softmax' converts similarities to probabilities over DESNZ entries.",
-    )
-    parser.add_argument(
-        "--softmax-temperature",
-        type=float,
-        default=1.0,
-        help="Temperature parameter when using softmax scoring (higher = flatter distribution).",
-    )
-    parser.add_argument(
         "--top-k",
         type=int,
         default=3,
@@ -242,18 +230,7 @@ def main() -> None:
     print(f"[4/5] Computing similarity matrix (mode='{args.score_mode}')")
     similarity_matrix = np.matmul(purchase_embeddings, desnz_embeddings.T)
 
-    if args.score_mode == "softmax":
-        logits = similarity_matrix / max(args.softmax_temperature, 1e-6)
-        logits = logits - logits.max(axis=1, keepdims=True)
-        exp_logits = np.exp(logits)
-        exp_sum = exp_logits.sum(axis=1, keepdims=True)
-        # Avoid division by zero
-        exp_sum = np.where(exp_sum == 0, 1e-9, exp_sum)
-        prob_matrix = exp_logits / exp_sum
-
-        score_matrix = prob_matrix
-    else:
-        score_matrix = similarity_matrix
+    score_matrix = similarity_matrix
 
     print("[5/5] Preparing output")
     all_matches: List[Dict[str, Any]] = []
