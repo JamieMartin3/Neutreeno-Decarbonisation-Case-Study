@@ -143,10 +143,13 @@ def main() -> None:
         default=Path("Case-Study-Data/processed/purchase_match_summary.json"),
         help="Path to write aggregate matching statistics.",
     )
+    # Can use sentence-transformers/multi-qa-mpnet-base-dot-v1
+    # Can use sentence-transformers/all-mpnet-base-v2
+    # Can use BAAI/bge-small-en-v1.5
     parser.add_argument(
         "--model",
         type=str,
-        default="sentence-transformers/all-mpnet-base-v2",
+        default="BAAI/bge-small-en-v1.5",
         help="Sentence-BERT model to use for embeddings.",
     )
     parser.add_argument(
@@ -175,12 +178,16 @@ def main() -> None:
     parser.add_argument(
         "--ambiguity-margin",
         type=float,
-        default=0.02,
+        default=0.005,
         help="Flag matches as ambiguous when the top-three scores are within this margin.",
     )
     args = parser.parse_args()
 
     base_dir = Path(__file__).resolve().parent
+
+    # ----------------------------------------------------------------------------------------------------------
+    # Prepare Input and Output Paths
+    # ----------------------------------------------------------------------------------------------------------
 
     purchases_path = args.purchases if args.purchases.is_absolute() else base_dir / args.purchases
     desnz_path = args.desnz if args.desnz.is_absolute() else base_dir / args.desnz
@@ -199,9 +206,15 @@ def main() -> None:
     top3_output_path.parent.mkdir(parents=True, exist_ok=True)
     summary_output_path.parent.mkdir(parents=True, exist_ok=True)
     log_path = None
+
     if args.log_file:
         log_path = args.log_file if args.log_file.is_absolute() else base_dir / args.log_file
         log_path.parent.mkdir(parents=True, exist_ok=True)
+
+
+    # ----------------------------------------------------------------------------------------------------------
+    # Perform Embedding and Similarity Computation for each Purchase and DESNZ Entry
+    # ----------------------------------------------------------------------------------------------------------
 
     print("[1/5] Loading data")
     purchase_records = load_json(purchases_path)
@@ -222,12 +235,14 @@ def main() -> None:
     purchase_texts = [build_purchase_text(entry) for entry in purchase_records]
     desnz_texts = [build_desnz_text(entry) for entry in desnz_records]
 
+    # Embedding stage — map purchase and DESNZ text into the shared SBERT vector space.
     print("[3/5] Loading model and encoding texts")
     model = SentenceTransformer(args.model)
     desnz_embeddings = encode_texts(model, desnz_texts, batch_size=args.batch_size)
     purchase_embeddings = encode_texts(model, purchase_texts, batch_size=args.batch_size)
 
-    print(f"[4/5] Computing similarity matrix (mode='{args.score_mode}')")
+    # Similarity stage — once both corpora are embedded we can compare them via cosine similarity.
+    print(f"[4/5] Computing similarity matrix")
     similarity_matrix = np.matmul(purchase_embeddings, desnz_embeddings.T)
 
     score_matrix = similarity_matrix
@@ -244,18 +259,20 @@ def main() -> None:
     ambiguous_ids: List[Any] = []
     unmatched_ids: List[Any] = []
 
-    top_k = min(max(args.top_k, 1), len(desnz_records))
+    requested_top_k = min(max(args.top_k, 1), len(desnz_records))
+    # Always capture at least the top three matches so ambiguous reports can surface them.
+    detail_top_k = min(max(requested_top_k, 3), len(desnz_records))
 
     low_bound = float(np.min(similarity_matrix))
     high_bound = float(np.max(similarity_matrix))
-    
+    # Denominator for confidence scaling; avoid zero division.
     denom = high_bound - low_bound if (high_bound - low_bound) != 0 else 1.0
 
     for idx, record in enumerate(purchase_records):
         score_vector = score_matrix[idx]
         cosine_vector = similarity_matrix[idx]
         sorted_indices = np.argsort(-score_vector)
-        selected_idxs = sorted_indices[:top_k]
+        selected_idxs = sorted_indices[:detail_top_k]
 
         matches: List[Dict[str, Any]] = []
         for rank, emission_idx in enumerate(selected_idxs, start=1):
@@ -265,20 +282,31 @@ def main() -> None:
                 "rank": rank,
                 "matched_emission_index": emission_idx_int,
                 "matched_emission": emission,
-                "score_mode": args.score_mode,
                 "score": float(score_vector[emission_idx]),
                 "cosine_similarity": float(cosine_vector[emission_idx]),
                 "desnz_id": emission.get("ID"),
             }
             matches.append(match_payload)
 
+        primary_matches = matches[:requested_top_k]
+        if not primary_matches:
+            continue
+
         purchase_id = record.get("purchase_id")
         purchase_identifier = purchase_id if purchase_id else f"purchase_{idx}"
-        top_score = matches[0]["score"]
-        second_score = matches[1]["score"] if len(matches) > 1 else high_bound
+        top_score = primary_matches[0]["score"]
+        second_score = primary_matches[1]["score"] if len(primary_matches) > 1 else high_bound
         margin = max(0.0, top_score - second_score)
-        uniqueness_value = min(1.0, max(0.0, margin / 0.02))
+        uniqueness_value = min(1.0, max(0.0, margin / 0.005))
 
+        # ----------------------------------------------------------------------------------------------------------
+        # Uncertainty Analysis
+        # ----------------------------------------------------------------------------------------------------------
+
+        # Uncertainty stage — derive interpretable diagnostics from the raw scores so analysts can vet results.
+        # Confidence scales the cosine similarity against the observed range for that run.
+        # Uniqueness measures the separation between the best and second-best scores; small margins reduce uniqueness.
+        # Uncertainty is the remaining risk after combining both signals (high when confidence is low or options are tied).
         for match in matches:
 
             raw_score = float(match["score"])
@@ -289,8 +317,14 @@ def main() -> None:
             match["uniqueness"] = uniqueness_value
             match["uncertainty"] = max(0.0, min(1.0, 1.0 - raw_conf))
 
-        best_confidence = matches[0]["confidence"]
+        best_confidence = primary_matches[0]["confidence"]
         ambiguous = uniqueness_value < 1.0 - 1e-9
+
+        # ----------------------------------------------------------------------------------------------------------
+        # Categorisation and Output Preparation
+        # ----------------------------------------------------------------------------------------------------------
+        # Categorises each match depending on uniqueness and confidence metrics, retaining either the top match
+        # or the top three matches as appropriate. Logs uncertain matches for analyst review.
 
         if ambiguous:
             uncertain_logs.append(
@@ -308,12 +342,12 @@ def main() -> None:
                     best_confidence, purchase_identifier
                 )
             )
-        elif best_confidence <= 0.6 and len(matches) > 1:
-            retain_count = min(3, len(matches))
-            retained_matches = matches[:retain_count]
+        elif best_confidence <= 0.6 and len(primary_matches) > 1:
+            retain_count = min(3, len(primary_matches))
+            retained_matches = primary_matches[:retain_count]
             needs_top3 = retain_count > 1
         else:
-            retained_matches = matches[:1]
+            retained_matches = primary_matches[:1]
             needs_top3 = False
 
         missing_for_purchase = False
@@ -355,7 +389,26 @@ def main() -> None:
         if missing_for_purchase and retained_matches:
             missing_entries.append(purchase_entry)
         if purchase_entry["is_ambiguous"]:
-            ambiguous_entries.append(purchase_entry)
+            top_matches_for_ambiguity = [
+                {
+                    "rank": match["rank"],
+                    "score": match["score"],
+                    "confidence": match["confidence"],
+                    "uniqueness": match["uniqueness"],
+                    "uncertainty": match["uncertainty"],
+                    "cosine_similarity": match.get("cosine_similarity"),
+                    "desnz_id": match.get("desnz_id"),
+                    "matched_emission": match["matched_emission"],
+                }
+                for match in matches[: min(3, len(matches))]
+            ]
+            ambiguous_entries.append(
+                {
+                    "purchase_id": purchase_identifier,
+                    "purchase_record": record,
+                    "top_matches": top_matches_for_ambiguity,
+                }
+            )
             ambiguous_ids.append(purchase_identifier)
         if purchase_entry["is_top3"]:
             top3_entries.append(purchase_entry)
@@ -366,6 +419,11 @@ def main() -> None:
 
         all_matches.append(purchase_entry)
         selected_results.append(purchase_entry)
+
+    # ----------------------------------------------------------------------------------------------------------
+    # Final Output
+    # ----------------------------------------------------------------------------------------------------------
+    # Write out the selected matches, detailed matches, and various categories of interest for analyst review
 
     with output_all_path.open("w", encoding="utf-8") as handle:
         json.dump(all_matches, handle, indent=2, ensure_ascii=False)
@@ -393,6 +451,8 @@ def main() -> None:
         "ambiguous_purchase_ids": ambiguous_ids,
         "unmatched_count": unmatched_count,
         "unmatched_percentage": (unmatched_count / total_purchases * 100.0) if total_purchases else 0.0,
+        "top1_count": len(top1_entries),
+        "top3_count": len(top3_entries),
     }
     with summary_output_path.open("w", encoding="utf-8") as handle:
         json.dump(summary_payload, handle, indent=2, ensure_ascii=False)
@@ -421,11 +481,18 @@ def main() -> None:
             unmatched_count, summary_payload["unmatched_percentage"]
         )
     )
+    print(f"Top 1 matches retained: {len(top1_entries)}")
+    print(f"Top 3 matches retained: {len(top3_entries)}")
     print(
         "Matching complete. Selected matches written to {0}, detailed matches to {1}".format(
             output_path, output_all_path
         )
     )
+    if ambiguous_ids:
+        formatted_ids = ", ".join(str(pid) for pid in ambiguous_ids)
+        print(f"Ambiguous purchases: {formatted_ids}")
+    else:
+        print("Ambiguous purchases: none")
 
 
 if __name__ == "__main__":
