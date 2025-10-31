@@ -450,6 +450,7 @@ def main() -> None:
         "ambiguous_count": len(ambiguous_ids),
         "ambiguous_purchase_ids": ambiguous_ids,
         "unmatched_count": unmatched_count,
+        "unmatched_purchase_ids": unmatched_ids,
         "unmatched_percentage": (unmatched_count / total_purchases * 100.0) if total_purchases else 0.0,
         "top1_count": len(top1_entries),
         "top3_count": len(top3_entries),
